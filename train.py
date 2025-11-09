@@ -215,6 +215,9 @@ def main():
     # Initialize W&B
     wandb.init(project="temperature-scheduling", name=args.exp_name, config=vars(args))
 
+    # create_ckpt_directory
+    os.makedirs(f'models/{args.exp_name}', exist_ok=True)
+
     # Load data
     train_loader, test_loader, num_classes = get_data_loaders(
         args.dataset, args.data_root, args.batch_size, args.num_workers, generator
