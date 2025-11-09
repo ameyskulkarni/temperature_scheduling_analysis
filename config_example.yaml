@@ -1,0 +1,174 @@
+# Example configuration file for temperature scheduling experiments
+# You can extend train.py to load from YAML if preferred
+
+# Experiment identification
+experiment:
+  name: "baseline_cifar100_t1.0"
+  seed: 42
+
+# Dataset configuration
+dataset:
+  name: "cifar100"  # cifar10, cifar100, cifar10_lt, cifar100_lt
+  data_root: "./data"
+  imbalance_ratio: 100  # Only for long-tail datasets
+
+# Model configuration
+model:
+  architecture: "resnet32"  # resnet18, resnet32, resnet34, wrn28_10, vit_tiny
+  num_classes: null  # Auto-detected if null
+
+# Training hyperparameters
+training:
+  epochs: 200
+  batch_size: 128
+  learning_rate: 0.1
+  momentum: 0.9
+  weight_decay: 0.0002  # 2e-4
+  lr_schedule: "constant"  # constant, step, cosine
+
+# Temperature configuration
+temperature:
+  schedule: "constant"  # constant, cosine, linear, exponential, step, warmup_cosine
+  T_max: 1.0
+  T_min: 1.0
+
+# Evaluation settings
+evaluation:
+  eval_corruptions: false
+  corruption_severity: 3
+
+# System settings
+system:
+  num_workers: 4
+  save_dir: "./checkpoints"
+  resume: null  # Path to checkpoint to resume from
+
+# Example configurations for different experiments:
+
+# ============================================================================
+# Baseline Experiments
+# ============================================================================
+
+baseline_t0.5:
+  temperature:
+    schedule: "constant"
+    T_max: 0.5
+
+baseline_t1.0:
+  temperature:
+    schedule: "constant"
+    T_max: 1.0
+
+baseline_t2.0:
+  temperature:
+    schedule: "constant"
+    T_max: 2.0
+
+baseline_t3.0:
+  temperature:
+    schedule: "constant"
+    T_max: 3.0
+
+# ============================================================================
+# Schedule Experiments
+# ============================================================================
+
+cosine_2to1:
+  temperature:
+    schedule: "cosine"
+    T_max: 2.0
+    T_min: 1.0
+
+cosine_3to1:
+  temperature:
+    schedule: "cosine"
+    T_max: 3.0
+    T_min: 1.0
+
+cosine_5to1:
+  temperature:
+    schedule: "cosine"
+    T_max: 5.0
+    T_min: 1.0
+
+linear_3to1:
+  temperature:
+    schedule: "linear"
+    T_max: 3.0
+    T_min: 1.0
+
+warmup_cosine:
+  temperature:
+    schedule: "warmup_cosine"
+    T_max: 3.0
+    T_min: 1.0
+
+# ============================================================================
+# Dataset Variants
+# ============================================================================
+
+cifar10_config:
+  dataset:
+    name: "cifar10"
+  model:
+    num_classes: 10
+
+cifar10_longtail:
+  dataset:
+    name: "cifar10_lt"
+    imbalance_ratio: 100
+  model:
+    num_classes: 10
+
+cifar100_longtail:
+  dataset:
+    name: "cifar100_lt"
+    imbalance_ratio: 100
+  model:
+    num_classes: 100
+
+# ============================================================================
+# Architecture Variants
+# ============================================================================
+
+wrn28_10_config:
+  model:
+    architecture: "wrn28_10"
+  training:
+    batch_size: 128
+    epochs: 200
+
+vit_tiny_config:
+  model:
+    architecture: "vit_tiny"
+  training:
+    batch_size: 128
+    epochs: 300
+    learning_rate: 0.001
+    weight_decay: 0.05
+
+# ============================================================================
+# Full Evaluation Config
+# ============================================================================
+
+full_evaluation:
+  temperature:
+    schedule: "cosine"
+    T_max: 3.0
+    T_min: 1.0
+  evaluation:
+    eval_corruptions: true
+    corruption_severity: 3
+  training:
+    epochs: 200
+
+# ============================================================================
+# Quick Test Config (Fast iteration)
+# ============================================================================
+
+quick_test:
+  training:
+    epochs: 50
+    batch_size: 256
+  evaluation:
+    eval_corruptions: false
