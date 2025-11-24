@@ -16,8 +16,10 @@ import wandb
 from tqdm import tqdm
 
 from models import get_model
+from lr_scheduler import get_lr_scheduler
 from temperature_schedulers import get_temperature_scheduler
 from utils import compute_ece, evaluate_on_corruptions
+from shape_texture_bias import run_bias_evaluation
 
 
 def parse_args():
@@ -31,6 +33,7 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='cifar100',
                         choices=['cifar10', 'cifar100'],
                         help='Dataset to use')
+
     parser.add_argument('--data-root', type=str, default='./data',
                         help='Path to dataset root')
 
@@ -42,10 +45,21 @@ def parse_args():
     # Training
     parser.add_argument('--epochs', type=int, default=200,
                         help='Number of training epochs')
+
     parser.add_argument('--batch-size', type=int, default=128,
                         help='Batch size for training')
+
     parser.add_argument('--lr', type=float, default=0.1,
                         help='Learning rate (constant)')
+    parser.add_argument('--lr-schedule', type=str, default='constant',
+                        choices=['constant', 'cosine', 'cosine_warmup'],
+                        help='Learning rate schedule type')
+    parser.add_argument('--lr-min', type=float, default=0.0,
+                        help='Minimum learning rate for cosine annealing')
+
+    parser.add_argument('--warmup-epochs', type=int, default=10,
+                        help='Number of warmup epochs for cosine_warmup schedule')
+
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='SGD momentum')
     parser.add_argument('--weight-decay', type=float, default=5e-4,
@@ -63,6 +77,9 @@ def parse_args():
     # Evaluation
     parser.add_argument('--eval-corruptions', action='store_true',
                         help='Evaluate on CIFAR-C for best checkpoint')
+
+    parser.add_argument('--eval-shape-texture', action='store_true',
+                        help='Evaluate shape vs texture bias on best checkpoint')
 
     # System
     parser.add_argument('--seed', type=int, default=42,
@@ -150,6 +167,7 @@ def train_epoch(model, train_loader, optimizer, temperature, device, epoch):
     total_loss = 0
     correct = 0
     total = 0
+    grad_norms = []
 
     pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
     for inputs, targets in pbar:
@@ -159,6 +177,10 @@ def train_epoch(model, train_loader, optimizer, temperature, device, epoch):
         logits = model(inputs)
         loss = temperature_scaled_loss(logits, targets, temperature)
         loss.backward()
+
+        grad_norm = compute_gradient_norm(model)
+        grad_norms.append(grad_norm)
+
         optimizer.step()
 
         total_loss += loss.item() * inputs.size(0)
@@ -170,7 +192,9 @@ def train_epoch(model, train_loader, optimizer, temperature, device, epoch):
                          'acc': f'{100.*correct/total:.2f}%',
                          'T': f'{temperature:.2f}'})
 
-    return total_loss / total, 100. * correct / total
+        mean_grad_norm = sum(grad_norms) / len(grad_norms)
+
+    return total_loss / total, 100. * correct / total, mean_grad_norm
 
 
 def validate(model, test_loader, temperature, device):
@@ -204,6 +228,15 @@ def validate(model, test_loader, temperature, device):
 
     return total_loss / total, 100. * correct / total, all_probs, all_targets
 
+def compute_gradient_norm(model):
+    """Compute L2 norm of gradients"""
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm ** 0.5
+
 
 def main():
     args = parse_args()
@@ -216,7 +249,8 @@ def main():
     wandb.init(project="temperature-scheduling", name=args.exp_name, config=vars(args))
 
     # create_ckpt_directory
-    os.makedirs(f'models/{args.exp_name}', exist_ok=True)
+    save_dir = f'models/{args.exp_name}'
+    os.makedirs(save_dir, exist_ok=True)
 
     # Load data
     train_loader, test_loader, num_classes = get_data_loaders(
@@ -234,6 +268,15 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
                          momentum=args.momentum, weight_decay=args.weight_decay)
 
+    # Learning rate scheduler
+    lr_scheduler = get_lr_scheduler(
+        args.lr_schedule,
+        lr_max=args.lr,
+        lr_min=args.lr_min,
+        total_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs
+    )
+
     # Temperature scheduler
     temp_scheduler = get_temperature_scheduler(
         args.temp_schedule, T_max=args.temp_max, T_min=args.temp_min,
@@ -246,8 +289,12 @@ def main():
     for epoch in range(args.epochs):
         current_temp = temp_scheduler.get_temperature(epoch)
 
+        current_lr = lr_scheduler.get_lr(epoch)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, grad_norm = train_epoch(
             model, train_loader, optimizer, current_temp, device, epoch
         )
 
@@ -265,9 +312,10 @@ def main():
         log_dict = {
             'hyperparams/epoch': epoch,
             'hyperparams/temperature': current_temp,
-            'hyperparams/learning_rate': args.lr,
+            'hyperparams/learning_rate': current_lr,
             'train/loss': train_loss,
             'train/accuracy': train_acc,
+            'train/grad_norm': grad_norm,
             'val/loss': val_loss,
             'val/accuracy': val_acc,
         }
@@ -277,7 +325,7 @@ def main():
         wandb.log(log_dict)
 
         # Print summary
-        print(f'Epoch {epoch}: T={current_temp:.2f}, Train Acc={train_acc:.2f}%, '
+        print(f'Epoch {epoch}: LR={current_lr:.6f}, T={current_temp:.2f}, Train Acc={train_acc:.2f}%, '
               f'Val Acc={val_acc:.2f}%', end='')
         if val_ece is not None:
             print(f', ECE={val_ece:.4f}')
@@ -287,16 +335,16 @@ def main():
         # Save best model with training temperature
         if val_acc > best_acc:
             best_epoch = epoch
+            best_acc = val_acc
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
             }
-            torch.save(checkpoint, f'models/{args.exp_name}/best_model.pth')
-            print(f'✓ New best: {best_acc:.2f}% (train T={current_temp:.2f})')
+            torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
 
         # Save model checkpoint every few epochs
-        if epoch % 10 == 0 or epoch == args.epochs - 1:
+        if epoch % 5 == 0 or epoch == args.epochs - 1:
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
@@ -313,7 +361,7 @@ def main():
     print('='*60)
 
     # Load checkpoint
-    checkpoint = torch.load('best_model.pth')
+    checkpoint = torch.load(os.path.join(save_dir, 'best_model.pth'), weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     train_temp = checkpoint['train_temperature']
 
@@ -440,6 +488,50 @@ def main():
                     corruption_results_T1['per_corruption'][corruption]['accuracy']
                 final_metrics[f'corruption_T1/{corruption}_ece'] = \
                     corruption_results_T1['per_corruption'][corruption]['ece']
+
+    # ================================================================
+    # Shape vs Texture evaluation (if requested)
+    # ================================================================
+
+    if args.eval_shape_texture:
+        print('\n' + '=' * 60)
+        print('Evaluating Shape vs Texture Bias...')
+        print('=' * 60)
+
+        # Load test dataset without normalization
+        test_transform_raw = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+        if args.dataset == 'cifar10':
+            test_dataset_raw = torchvision.datasets.CIFAR10(
+                root=args.data_root, train=False, download=True,
+                transform=test_transform_raw
+            )
+            indices_path = 'shuffle_indices_cifar10.npy'  # *** DATASET-SPECIFIC ***
+        else:  # cifar100
+            test_dataset_raw = torchvision.datasets.CIFAR100(
+                root=args.data_root, train=False, download=True,
+                transform=test_transform_raw
+            )
+            indices_path = 'shuffle_indices_cifar100.npy'  # *** DATASET-SPECIFIC ***
+
+        # Run bias evaluation (will use deterministic shuffles)
+        bias_results = run_bias_evaluation(
+            model, test_dataset_raw, args.batch_size, device,
+            shuffle_indices_path=indices_path  # *** PASS THE PATH ***
+        )
+
+        # Log to WandB
+        final_metrics.update({
+            'bias/original_accuracy': bias_results['original_accuracy'],
+            'bias/patch_shuffled_accuracy': bias_results['patch_shuffled_accuracy'],
+            'bias/edge_preserved_accuracy': bias_results['edge_preserved_accuracy'],
+            'bias/highpass_accuracy': bias_results['highpass_accuracy'],
+            'bias/shape_bias_score': bias_results['shape_bias_score'],
+            'bias/shape_bias_ratio': bias_results['shape_bias_ratio'],
+            'bias/texture_dependency': bias_results['texture_dependency'],
+        })
     # ================================================================
     # Summary
     # ================================================================
