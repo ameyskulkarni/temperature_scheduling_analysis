@@ -39,7 +39,7 @@ def parse_args():
 
     # Model
     parser.add_argument('--model', type=str, default='resnet32',
-                        choices=['resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet164', 'wrn28_10'],
+                        choices=['resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet50_cifar', 'resnet110', 'resnet164', 'wrn28_10'],
                         help='Model architecture')
 
     # Training
@@ -67,12 +67,14 @@ def parse_args():
 
     # Temperature
     parser.add_argument('--temp-schedule', type=str, default='constant',
-                        choices=['constant', 'cosine', 'linear'],
+                        choices=['constant', 'cosine', 'linear', 'reverse_cosine', 'cyclic_sinusoidal', 'cyclic_triangular'],
                         help='Temperature schedule type')
     parser.add_argument('--temp-max', type=float, default=1.0,
                         help='Maximum/initial temperature')
     parser.add_argument('--temp-min', type=float, default=1.0,
                         help='Minimum/final temperature')
+    parser.add_argument('--temp-cycle-length', type=int, default=40,
+                        help='Cycle length (epochs) for cyclic schedules')
 
     # Evaluation
     parser.add_argument('--eval-corruptions', action='store_true',
@@ -80,6 +82,12 @@ def parse_args():
 
     parser.add_argument('--eval-shape-texture', action='store_true',
                         help='Evaluate shape vs texture bias on best checkpoint')
+
+    parser.add_argument('--eval-adversarial', action='store_true',
+                        help='Evaluate adversarial robustness (PGD-20 and C&W) on best checkpoint')
+
+    parser.add_argument('--adv-epsilon', type=float, default=8 / 255,
+                        help='Adversarial perturbation budget (default: 8/255)')
 
     # System
     parser.add_argument('--seed', type=int, default=42,
@@ -246,7 +254,7 @@ def main():
     generator = set_seed(args.seed)
 
     # Initialize W&B
-    wandb.init(project="temperature-scheduling", name=args.exp_name, config=vars(args))
+    wandb.init(project="temperature-scheduling-resnet50-cifar", name=args.exp_name, config=vars(args))
 
     # create_ckpt_directory
     save_dir = f'models/{args.exp_name}'
@@ -278,9 +286,12 @@ def main():
     )
 
     # Temperature scheduler
+    temp_kwargs = {}
+    if args.temp_schedule == 'cyclic_sinusoidal' or args.temp_schedule == 'cyclic_triangular':
+        temp_kwargs = {'cycle_length': args.temp_cycle_length}
     temp_scheduler = get_temperature_scheduler(
         args.temp_schedule, T_max=args.temp_max, T_min=args.temp_min,
-        total_epochs=args.epochs
+        total_epochs=args.epochs, **temp_kwargs
     )
 
     # Training loop
@@ -344,7 +355,7 @@ def main():
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
 
         # Save model checkpoint every few epochs
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
+        if epoch % 10 == 0 or epoch == args.epochs - 1:
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
@@ -495,12 +506,12 @@ def main():
 
     if args.eval_shape_texture:
         print('\n' + '=' * 60)
-        print('Evaluating Shape vs Texture Bias...')
+        print('Evaluating Perturbation Robustness (Shape/Texture Proxy)...')
         print('=' * 60)
 
-        # Load test dataset without normalization
+        # ✅ FIX: Load test dataset WITHOUT normalization (will be applied in perturbed datasets)
         test_transform_raw = transforms.Compose([
-            transforms.ToTensor(),
+            transforms.ToTensor(),  # Only ToTensor, no normalization
         ])
 
         if args.dataset == 'cifar10':
@@ -508,30 +519,148 @@ def main():
                 root=args.data_root, train=False, download=True,
                 transform=test_transform_raw
             )
-            indices_path = 'shuffle_indices_cifar10.npy'  # *** DATASET-SPECIFIC ***
+            indices_path = 'shuffle_indices_cifar10.npy'
         else:  # cifar100
             test_dataset_raw = torchvision.datasets.CIFAR100(
                 root=args.data_root, train=False, download=True,
                 transform=test_transform_raw
             )
-            indices_path = 'shuffle_indices_cifar100.npy'  # *** DATASET-SPECIFIC ***
+            indices_path = 'shuffle_indices_cifar100.npy'
 
-        # Run bias evaluation (will use deterministic shuffles)
-        bias_results = run_bias_evaluation(
-            model, test_dataset_raw, args.batch_size, device,
-            shuffle_indices_path=indices_path  # *** PASS THE PATH ***
+        # ✅ FIX: Evaluate with BOTH training temperature and T=1.0
+        print(f"\n--- Evaluating with Training Temperature (T={train_temp:.2f}) ---")
+        bias_results_Ttrain = run_bias_evaluation(
+            model, test_dataset_raw, args.dataset, args.batch_size, device,
+            temperature=train_temp,  # ✅ Use training temperature
+            shuffle_indices_path=indices_path
         )
 
-        # Log to WandB
+        print(f"\n--- Evaluating with Standard Temperature (T=1.0) ---")
+        bias_results_T1 = run_bias_evaluation(
+            model, test_dataset_raw, args.dataset, args.batch_size, device,
+            temperature=1.0,  # ✅ Standard temperature
+            shuffle_indices_path=indices_path
+        )
+
+        # ✅ FIX: Log BOTH sets of results with corrected metric names
         final_metrics.update({
-            'bias/original_accuracy': bias_results['original_accuracy'],
-            'bias/patch_shuffled_accuracy': bias_results['patch_shuffled_accuracy'],
-            'bias/edge_preserved_accuracy': bias_results['edge_preserved_accuracy'],
-            'bias/highpass_accuracy': bias_results['highpass_accuracy'],
-            'bias/shape_bias_score': bias_results['shape_bias_score'],
-            'bias/shape_bias_ratio': bias_results['shape_bias_ratio'],
-            'bias/texture_dependency': bias_results['texture_dependency'],
+            # Training temperature results
+            'bias_Ttrain/original_accuracy': bias_results_Ttrain['original_accuracy'],
+            'bias_Ttrain/patch_shuffled_accuracy': bias_results_Ttrain['patch_shuffled_accuracy'],
+            'bias_Ttrain/edge_preserved_accuracy': bias_results_Ttrain['edge_preserved_accuracy'],
+            'bias_Ttrain/highpass_accuracy': bias_results_Ttrain['highpass_accuracy'],
+            'bias_Ttrain/robustness_score': bias_results_Ttrain['perturbation_robustness_score'],
+            'bias_Ttrain/robustness_ratio': bias_results_Ttrain['robustness_ratio'],
+            'bias_Ttrain/texture_dependency': bias_results_Ttrain['texture_dependency'],
+
+            # T=1.0 results
+            'bias_T1/original_accuracy': bias_results_T1['original_accuracy'],
+            'bias_T1/patch_shuffled_accuracy': bias_results_T1['patch_shuffled_accuracy'],
+            'bias_T1/edge_preserved_accuracy': bias_results_T1['edge_preserved_accuracy'],
+            'bias_T1/highpass_accuracy': bias_results_T1['highpass_accuracy'],
+            'bias_T1/robustness_score': bias_results_T1['perturbation_robustness_score'],
+            'bias_T1/robustness_ratio': bias_results_T1['robustness_ratio'],
+            'bias_T1/texture_dependency': bias_results_T1['texture_dependency'],
+
+            # Comparison
+            'bias/robustness_ratio_diff_T1_vs_Ttrain':
+                bias_results_T1['robustness_ratio'] - bias_results_Ttrain['robustness_ratio'],
         })
+
+        # Print comparison
+        print(f"\n{'Metric':<30} {'T={train_temp:.2f}':<15} {'T=1.0':<15} {'Diff':<15}")
+        print('-' * 75)
+        print(f"{'Robustness Ratio':<30} {bias_results_Ttrain['robustness_ratio']:<15.4f} "
+              f"{bias_results_T1['robustness_ratio']:<15.4f} "
+              f"{bias_results_T1['robustness_ratio'] - bias_results_Ttrain['robustness_ratio']:<+15.4f}")
+        print(f"{'Texture Dependency':<30} {bias_results_Ttrain['texture_dependency']:<15.4f} "
+              f"{bias_results_T1['texture_dependency']:<15.4f} "
+              f"{bias_results_T1['texture_dependency'] - bias_results_Ttrain['texture_dependency']:<+15.4f}")
+
+    # ================================================================
+    # Adversarial robustness evaluation (if requested)
+    # ================================================================
+
+    if args.eval_adversarial:
+        print('\n' + '=' * 60)
+        print('Evaluating Adversarial Robustness...')
+        print('=' * 60)
+
+        from adversarial_attacks import evaluate_both_attacks
+
+        # Evaluate with training temperature
+        print(f'\n--- Adversarial Attacks with Training Temperature (T={train_temp:.2f}) ---')
+        adv_results_Ttrain = evaluate_both_attacks(
+            model, args.dataset, args.data_root, args.batch_size,
+            args.num_workers, device, temperature=train_temp,
+            epsilon=args.adv_epsilon
+        )
+
+        print(f'\nPGD-20 Results (T={train_temp:.2f}):')
+        print(f'  Clean Accuracy:        {adv_results_Ttrain["pgd"]["clean_accuracy"]:.2f}%')
+        print(f'  Adversarial Accuracy:  {adv_results_Ttrain["pgd"]["adversarial_accuracy"]:.2f}%')
+        print(f'  Attack Success Rate:   {adv_results_Ttrain["pgd"]["attack_success_rate"]:.2f}%')
+
+        print(f'\nC&W Results (T={train_temp:.2f}):')
+        print(f'  Clean Accuracy:        {adv_results_Ttrain["cw"]["clean_accuracy"]:.2f}%')
+        print(f'  Adversarial Accuracy:  {adv_results_Ttrain["cw"]["adversarial_accuracy"]:.2f}%')
+        print(f'  Attack Success Rate:   {adv_results_Ttrain["cw"]["attack_success_rate"]:.2f}%')
+
+        # Evaluate with T=1.0
+        print(f'\n--- Adversarial Attacks with Standard Temperature (T=1.0) ---')
+        adv_results_T1 = evaluate_both_attacks(
+            model, args.dataset, args.data_root, args.batch_size,
+            args.num_workers, device, temperature=1.0,
+            epsilon=args.adv_epsilon
+        )
+
+        print(f'\nPGD-20 Results (T=1.0):')
+        print(f'  Clean Accuracy:        {adv_results_T1["pgd"]["clean_accuracy"]:.2f}%')
+        print(f'  Adversarial Accuracy:  {adv_results_T1["pgd"]["adversarial_accuracy"]:.2f}%')
+        print(f'  Attack Success Rate:   {adv_results_T1["pgd"]["attack_success_rate"]:.2f}%')
+
+        print(f'\nC&W Results (T=1.0):')
+        print(f'  Clean Accuracy:        {adv_results_T1["cw"]["clean_accuracy"]:.2f}%')
+        print(f'  Adversarial Accuracy:  {adv_results_T1["cw"]["adversarial_accuracy"]:.2f}%')
+        print(f'  Attack Success Rate:   {adv_results_T1["cw"]["attack_success_rate"]:.2f}%')
+
+        # Comparison
+        pgd_adv_acc_diff = adv_results_T1['pgd']['adversarial_accuracy'] - adv_results_Ttrain['pgd'][
+            'adversarial_accuracy']
+        cw_adv_acc_diff = adv_results_T1['cw']['adversarial_accuracy'] - adv_results_Ttrain['cw'][
+            'adversarial_accuracy']
+
+        print(f'\n--- Adversarial Robustness Comparison ---')
+        print(f'PGD-20 Adversarial Accuracy difference (T=1.0 - T={train_temp:.2f}): {pgd_adv_acc_diff:+.2f}%')
+        print(f'C&W Adversarial Accuracy difference (T=1.0 - T={train_temp:.2f}): {cw_adv_acc_diff:+.2f}%')
+
+        # Add to metrics
+        final_metrics.update({
+            # PGD with training temperature
+            'adversarial/pgd_clean_accuracy_Ttrain': adv_results_Ttrain['pgd']['clean_accuracy'],
+            'adversarial/pgd_adv_accuracy_Ttrain': adv_results_Ttrain['pgd']['adversarial_accuracy'],
+            'adversarial/pgd_attack_success_Ttrain': adv_results_Ttrain['pgd']['attack_success_rate'],
+
+            # PGD with T=1.0
+            'adversarial/pgd_clean_accuracy_T1': adv_results_T1['pgd']['clean_accuracy'],
+            'adversarial/pgd_adv_accuracy_T1': adv_results_T1['pgd']['adversarial_accuracy'],
+            'adversarial/pgd_attack_success_T1': adv_results_T1['pgd']['attack_success_rate'],
+
+            # C&W with training temperature
+            'adversarial/cw_clean_accuracy_Ttrain': adv_results_Ttrain['cw']['clean_accuracy'],
+            'adversarial/cw_adv_accuracy_Ttrain': adv_results_Ttrain['cw']['adversarial_accuracy'],
+            'adversarial/cw_attack_success_Ttrain': adv_results_Ttrain['cw']['attack_success_rate'],
+
+            # C&W with T=1.0
+            'adversarial/cw_clean_accuracy_T1': adv_results_T1['cw']['clean_accuracy'],
+            'adversarial/cw_adv_accuracy_T1': adv_results_T1['cw']['adversarial_accuracy'],
+            'adversarial/cw_attack_success_T1': adv_results_T1['cw']['attack_success_rate'],
+
+            # Differences
+            'adversarial/pgd_adv_acc_diff_T1_vs_Ttrain': pgd_adv_acc_diff,
+            'adversarial/cw_adv_acc_diff_T1_vs_Ttrain': cw_adv_acc_diff,
+        })
+
     # ================================================================
     # Summary
     # ================================================================
@@ -548,6 +677,12 @@ def main():
     if args.eval_corruptions:
         print(f'{"Corruption Accuracy (%)":<30} {corruption_results_Ttrain["mean_acc"]:<15.2f} {corruption_results_T1["mean_acc"]:<15.2f} {corr_acc_diff:<+15.2f}')
         print(f'{"Corruption ECE":<30} {corruption_results_Ttrain["mean_ece"]:<15.4f} {corruption_results_T1["mean_ece"]:<15.4f} {corr_ece_diff:<+15.4f}')
+
+    if args.eval_adversarial:
+        print(
+            f'{"PGD-20 Adv Acc (%)":<30} {adv_results_Ttrain["pgd"]["adversarial_accuracy"]:<15.2f} {adv_results_T1["pgd"]["adversarial_accuracy"]:<15.2f} {pgd_adv_acc_diff:<+15.2f}')
+        print(
+            f'{"C&W Adv Acc (%)":<30} {adv_results_Ttrain["cw"]["adversarial_accuracy"]:<15.2f} {adv_results_T1["cw"]["adversarial_accuracy"]:<15.2f} {cw_adv_acc_diff:<+15.2f}')
 
     print()
     print('Note: Diff = (T=1.0) - (T_train)')

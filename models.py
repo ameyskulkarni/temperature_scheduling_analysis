@@ -6,7 +6,7 @@ Includes ResNets, WideResNet, and Vision Transformers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torchvision import models
 
 # ============================================================================
 # ResNet for CIFAR (32x32 images)
@@ -124,6 +124,33 @@ def resnet44(num_classes=10):
 def resnet56(num_classes=10):
     """ResNet-56 for CIFAR"""
     return ResNet_CIFAR(BasicBlock, [9, 9, 9], num_classes=num_classes)
+
+
+def resnet50_cifar(num_classes=100):
+    """ResNet-50 adapted for CIFAR (32×32 images)
+        ResNet-50 adapted for CIFAR-10/100
+
+    Key modifications from torchvision ResNet-50:
+    1. First conv: 7×7 stride=2 → 3×3 stride=1 (preserve spatial dims)
+    2. Remove maxpool (too aggressive for 32×32)
+
+    References:
+    - He et al. "Deep Residual Learning" (original ResNet)
+    - Common practice in CIFAR literature
+    """
+    model = models.resnet50(num_classes=num_classes)
+
+    # CRITICAL MODIFICATIONS:
+    # 1. Replace first 7×7 conv (stride=2) with 3×3 conv (stride=1)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1,
+                            padding=1, bias=False)
+
+    # 2. Remove maxpool (too aggressive for 32×32)
+    model.maxpool = nn.Identity()
+
+    return model
+
+
 
 
 # ============================================================================
@@ -274,6 +301,7 @@ def get_model(model_name, num_classes=10):
         'resnet34': resnet34,
         'resnet44': resnet44,
         'resnet50': resnet50,
+        'resnet50_cifar': resnet50_cifar,
         'resnet56': resnet56,
         'wrn28_10': wrn28_10,
         'vit_tiny': vit_tiny,
