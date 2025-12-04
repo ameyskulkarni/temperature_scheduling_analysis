@@ -20,6 +20,7 @@ from lr_scheduler import get_lr_scheduler
 from temperature_schedulers import get_temperature_scheduler
 from utils import compute_ece, evaluate_on_corruptions
 from shape_texture_bias import run_bias_evaluation
+from adversarial_attacks import evaluate_both_attacks
 
 
 def parse_args():
@@ -351,6 +352,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
+                'val_accuracy': val_acc,
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
 
@@ -360,6 +362,18 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
+                'val_accuracy': val_acc,
+            }
+            torch.save(checkpoint, f'models/{args.exp_name}/model_{epoch}.pth')
+            print(f'Checkpoint saved at epoch {epoch}.')
+
+        # Save model checkpoint every few epochs
+        if epoch > 159 and epoch % 2 == 0:
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'epoch': epoch,
+                'train_temperature': current_temp,  # Save the temperature used during training
+                'val_accuracy': val_acc,
             }
             torch.save(checkpoint, f'models/{args.exp_name}/model_{epoch}.pth')
             print(f'Checkpoint saved at epoch {epoch}.')
@@ -417,21 +431,21 @@ def main():
     # Log final metrics to W&B
     final_metrics = {
         # Metadata
-        'final/train_temperature': train_temp,
-        'final/best_epoch': checkpoint['epoch'],
-        'final/best_val_accuracy': best_acc,
+        'hyperparams/final_train_temperature': train_temp,
+        'hyperparams/best_epoch': checkpoint['epoch'],
+        'test/best_val_accuracy_Ttrain': best_acc,
 
         # Evaluation with training temperature
-        'final/test_accuracy_Ttrain': test_acc_Ttrain,
-        'final/test_ece_Ttrain': test_ece_Ttrain,
+        'test/test_accuracy_Ttrain': test_acc_Ttrain,
+        'test/test_ece_Ttrain': test_ece_Ttrain,
 
         # Evaluation with T=1.0 (standard comparison)
-        'final/test_accuracy_T1': test_acc_T1,
-        'final/test_ece_T1': test_ece_T1,
+        'test/test_accuracy_T1': test_acc_T1,
+        'test/test_ece_T1': test_ece_T1,
 
         # Differences
-        'final/accuracy_diff_T1_vs_Ttrain': acc_diff,
-        'final/ece_diff_T1_vs_Ttrain': ece_diff,
+        'test/accuracy_diff_T1_vs_Ttrain': acc_diff,
+        'test/ece_diff_T1_vs_Ttrain': ece_diff,
     }
 
     # ================================================================
@@ -473,16 +487,16 @@ def main():
         # Add to metrics
         final_metrics.update({
             # Corruptions with training temperature
-            'final/corruption_accuracy_Ttrain': corruption_results_Ttrain['mean_acc'],
-            'final/corruption_ece_Ttrain': corruption_results_Ttrain['mean_ece'],
+            'corruption/corruption_accuracy_Ttrain': corruption_results_Ttrain['mean_acc'],
+            'corruption/corruption_ece_Ttrain': corruption_results_Ttrain['mean_ece'],
 
             # Corruptions with T=1.0
-            'final/corruption_accuracy_T1': corruption_results_T1['mean_acc'],
-            'final/corruption_ece_T1': corruption_results_T1['mean_ece'],
+            'corruption/corruption_accuracy_T1': corruption_results_T1['mean_acc'],
+            'corruption/corruption_ece_T1': corruption_results_T1['mean_ece'],
 
             # Differences
-            'final/corruption_accuracy_diff_T1_vs_Ttrain': corr_acc_diff,
-            'final/corruption_ece_diff_T1_vs_Ttrain': corr_ece_diff,
+            'corruption/corruption_accuracy_diff_T1_vs_Ttrain': corr_acc_diff,
+            'corruption/corruption_ece_diff_T1_vs_Ttrain': corr_ece_diff,
         })
 
         # Per-corruption results with both temperatures
@@ -509,192 +523,171 @@ def main():
         print('Evaluating Perturbation Robustness (Shape/Texture Proxy)...')
         print('=' * 60)
 
-        # ✅ FIX: Load test dataset WITHOUT normalization (will be applied in perturbed datasets)
-        test_transform_raw = transforms.Compose([
-            transforms.ToTensor(),  # Only ToTensor, no normalization
-        ])
+        indices_path = 'shuffle_indices_cifar100.npy'
 
-        if args.dataset == 'cifar10':
-            test_dataset_raw = torchvision.datasets.CIFAR10(
-                root=args.data_root, train=False, download=True,
-                transform=test_transform_raw
-            )
-            indices_path = 'shuffle_indices_cifar10.npy'
-        else:  # cifar100
-            test_dataset_raw = torchvision.datasets.CIFAR100(
-                root=args.data_root, train=False, download=True,
-                transform=test_transform_raw
-            )
-            indices_path = 'shuffle_indices_cifar100.npy'
-
-        # ✅ FIX: Evaluate with BOTH training temperature and T=1.0
         print(f"\n--- Evaluating with Training Temperature (T={train_temp:.2f}) ---")
         bias_results_Ttrain = run_bias_evaluation(
-            model, test_dataset_raw, args.dataset, args.batch_size, device,
+            model, args.dataset, args.data_root, args.batch_size * 2, device,
             temperature=train_temp,  # ✅ Use training temperature
             shuffle_indices_path=indices_path
         )
+        patch_shuffled_ECE_Ttrain = compute_ece(bias_results_Ttrain['shuffled_all_probs'], bias_results_Ttrain['shuffled_all_targets'])
 
         print(f"\n--- Evaluating with Standard Temperature (T=1.0) ---")
         bias_results_T1 = run_bias_evaluation(
-            model, test_dataset_raw, args.dataset, args.batch_size, device,
+            model, args.dataset, args.data_root, args.batch_size * 2, device,
             temperature=1.0,  # ✅ Standard temperature
             shuffle_indices_path=indices_path
         )
+        patch_shuffled_ECE_T1 = compute_ece(bias_results_T1['shuffled_all_probs'],
+                                                bias_results_T1['shuffled_all_targets'])
 
-        # ✅ FIX: Log BOTH sets of results with corrected metric names
         final_metrics.update({
             # Training temperature results
             'bias_Ttrain/original_accuracy': bias_results_Ttrain['original_accuracy'],
             'bias_Ttrain/patch_shuffled_accuracy': bias_results_Ttrain['patch_shuffled_accuracy'],
-            'bias_Ttrain/edge_preserved_accuracy': bias_results_Ttrain['edge_preserved_accuracy'],
-            'bias_Ttrain/highpass_accuracy': bias_results_Ttrain['highpass_accuracy'],
-            'bias_Ttrain/robustness_score': bias_results_Ttrain['perturbation_robustness_score'],
-            'bias_Ttrain/robustness_ratio': bias_results_Ttrain['robustness_ratio'],
-            'bias_Ttrain/texture_dependency': bias_results_Ttrain['texture_dependency'],
+            'bias_Ttrain/patch_shuffled_ECE_Ttrain': patch_shuffled_ECE_Ttrain,
 
             # T=1.0 results
             'bias_T1/original_accuracy': bias_results_T1['original_accuracy'],
             'bias_T1/patch_shuffled_accuracy': bias_results_T1['patch_shuffled_accuracy'],
-            'bias_T1/edge_preserved_accuracy': bias_results_T1['edge_preserved_accuracy'],
-            'bias_T1/highpass_accuracy': bias_results_T1['highpass_accuracy'],
-            'bias_T1/robustness_score': bias_results_T1['perturbation_robustness_score'],
-            'bias_T1/robustness_ratio': bias_results_T1['robustness_ratio'],
-            'bias_T1/texture_dependency': bias_results_T1['texture_dependency'],
+            'bias_T1/patch_shuffled_ECE_T1': patch_shuffled_ECE_T1,
 
-            # Comparison
-            'bias/robustness_ratio_diff_T1_vs_Ttrain':
-                bias_results_T1['robustness_ratio'] - bias_results_Ttrain['robustness_ratio'],
         })
 
         # Print comparison
         print(f"\n{'Metric':<30} {'T={train_temp:.2f}':<15} {'T=1.0':<15} {'Diff':<15}")
         print('-' * 75)
-        print(f"{'Robustness Ratio':<30} {bias_results_Ttrain['robustness_ratio']:<15.4f} "
-              f"{bias_results_T1['robustness_ratio']:<15.4f} "
-              f"{bias_results_T1['robustness_ratio'] - bias_results_Ttrain['robustness_ratio']:<+15.4f}")
-        print(f"{'Texture Dependency':<30} {bias_results_Ttrain['texture_dependency']:<15.4f} "
-              f"{bias_results_T1['texture_dependency']:<15.4f} "
-              f"{bias_results_T1['texture_dependency'] - bias_results_Ttrain['texture_dependency']:<+15.4f}")
 
     # ================================================================
     # Adversarial robustness evaluation (if requested)
     # ================================================================
 
     if args.eval_adversarial:
-        print('\n' + '=' * 60)
-        print('Evaluating Adversarial Robustness...')
-        print('=' * 60)
+        print('\n' + '=' * 70)
+        print('Evaluating Adversarial Robustness with Calibration Metrics...')
+        print('=' * 70)
+        print('\nNote: Per the temperature scaling paper (arXiv:2502.20604),')
+        print('all attacks are generated and evaluated with T=1.0')
 
-        from adversarial_attacks import evaluate_both_attacks
 
-        # Evaluate with training temperature
-        print(f'\n--- Adversarial Attacks with Training Temperature (T={train_temp:.2f}) ---')
-        adv_results_Ttrain = evaluate_both_attacks(
+
+        # Evaluate with T=1.0 only (per paper methodology)
+        # Attacks MUST use T=1 for proper comparison
+        adv_results = evaluate_both_attacks(
             model, args.dataset, args.data_root, args.batch_size,
-            args.num_workers, device, temperature=train_temp,
-            epsilon=args.adv_epsilon
+            args.num_workers, device, epsilon=args.adv_epsilon
         )
 
-        print(f'\nPGD-20 Results (T={train_temp:.2f}):')
-        print(f'  Clean Accuracy:        {adv_results_Ttrain["pgd"]["clean_accuracy"]:.2f}%')
-        print(f'  Adversarial Accuracy:  {adv_results_Ttrain["pgd"]["adversarial_accuracy"]:.2f}%')
-        print(f'  Attack Success Rate:   {adv_results_Ttrain["pgd"]["attack_success_rate"]:.2f}%')
+        # Extract results
+        pgd = adv_results['pgd']
+        cw = adv_results['cw']
 
-        print(f'\nC&W Results (T={train_temp:.2f}):')
-        print(f'  Clean Accuracy:        {adv_results_Ttrain["cw"]["clean_accuracy"]:.2f}%')
-        print(f'  Adversarial Accuracy:  {adv_results_Ttrain["cw"]["adversarial_accuracy"]:.2f}%')
-        print(f'  Attack Success Rate:   {adv_results_Ttrain["cw"]["attack_success_rate"]:.2f}%')
+        # Print detailed results
+        print(f'\n' + '=' * 70)
+        print('DETAILED ADVERSARIAL RESULTS')
+        print('=' * 70)
 
-        # Evaluate with T=1.0
-        print(f'\n--- Adversarial Attacks with Standard Temperature (T=1.0) ---')
-        adv_results_T1 = evaluate_both_attacks(
-            model, args.dataset, args.data_root, args.batch_size,
-            args.num_workers, device, temperature=1.0,
-            epsilon=args.adv_epsilon
-        )
+        print(f'\nPGD-20 Attack (ε={args.adv_epsilon:.4f}):')
+        print(f'  Clean Accuracy:           {pgd["clean_accuracy"]:.2f}%')
+        print(f'  Clean ECE:                {pgd["clean_ece"]:.4f}')
+        print(f'  Clean Mean Confidence:    {pgd["clean_mean_confidence"]:.2f}%')
+        print(f'  Adversarial Accuracy:     {pgd["adversarial_accuracy"]:.2f}%')
+        print(f'  Adversarial ECE:          {pgd["adversarial_ece"]:.4f}')
+        print(f'  Adversarial Mean Conf:    {pgd["adversarial_mean_confidence"]:.2f}%')
+        print(f'  Attack Success Rate:      {pgd["attack_success_rate"]:.2f}%')
+        print(f'  Confidence Drop:          {pgd["confidence_drop"]:.2f}pp')
+        print(f'  ECE Increase:             {pgd["ece_increase"]:.4f}')
 
-        print(f'\nPGD-20 Results (T=1.0):')
-        print(f'  Clean Accuracy:        {adv_results_T1["pgd"]["clean_accuracy"]:.2f}%')
-        print(f'  Adversarial Accuracy:  {adv_results_T1["pgd"]["adversarial_accuracy"]:.2f}%')
-        print(f'  Attack Success Rate:   {adv_results_T1["pgd"]["attack_success_rate"]:.2f}%')
-
-        print(f'\nC&W Results (T=1.0):')
-        print(f'  Clean Accuracy:        {adv_results_T1["cw"]["clean_accuracy"]:.2f}%')
-        print(f'  Adversarial Accuracy:  {adv_results_T1["cw"]["adversarial_accuracy"]:.2f}%')
-        print(f'  Attack Success Rate:   {adv_results_T1["cw"]["attack_success_rate"]:.2f}%')
-
-        # Comparison
-        pgd_adv_acc_diff = adv_results_T1['pgd']['adversarial_accuracy'] - adv_results_Ttrain['pgd'][
-            'adversarial_accuracy']
-        cw_adv_acc_diff = adv_results_T1['cw']['adversarial_accuracy'] - adv_results_Ttrain['cw'][
-            'adversarial_accuracy']
-
-        print(f'\n--- Adversarial Robustness Comparison ---')
-        print(f'PGD-20 Adversarial Accuracy difference (T=1.0 - T={train_temp:.2f}): {pgd_adv_acc_diff:+.2f}%')
-        print(f'C&W Adversarial Accuracy difference (T=1.0 - T={train_temp:.2f}): {cw_adv_acc_diff:+.2f}%')
+        print(f'\nC&W Attack (ε={args.adv_epsilon:.4f}):')
+        print(f'  Clean Accuracy:           {cw["clean_accuracy"]:.2f}%')
+        print(f'  Clean ECE:                {cw["clean_ece"]:.4f}')
+        print(f'  Clean Mean Confidence:    {cw["clean_mean_confidence"]:.2f}%')
+        print(f'  Adversarial Accuracy:     {cw["adversarial_accuracy"]:.2f}%')
+        print(f'  Adversarial ECE:          {cw["adversarial_ece"]:.4f}')
+        print(f'  Adversarial Mean Conf:    {cw["adversarial_mean_confidence"]:.2f}%')
+        print(f'  Attack Success Rate:      {cw["attack_success_rate"]:.2f}%')
+        print(f'  Confidence Drop:          {cw["confidence_drop"]:.2f}pp')
+        print(f'  ECE Increase:             {cw["ece_increase"]:.4f}')
 
         # Add to metrics
         final_metrics.update({
-            # PGD with training temperature
-            'adversarial/pgd_clean_accuracy_Ttrain': adv_results_Ttrain['pgd']['clean_accuracy'],
-            'adversarial/pgd_adv_accuracy_Ttrain': adv_results_Ttrain['pgd']['adversarial_accuracy'],
-            'adversarial/pgd_attack_success_Ttrain': adv_results_Ttrain['pgd']['attack_success_rate'],
+            # PGD metrics
+            'adversarial/pgd_clean_accuracy': pgd['clean_accuracy'],
+            'adversarial/pgd_clean_ece': pgd['clean_ece'],
+            'adversarial/pgd_clean_confidence': pgd['clean_mean_confidence'],
+            'adversarial/pgd_adv_accuracy': pgd['adversarial_accuracy'],
+            'adversarial/pgd_adv_ece': pgd['adversarial_ece'],
+            'adversarial/pgd_adv_confidence': pgd['adversarial_mean_confidence'],
+            'adversarial/pgd_attack_success': pgd['attack_success_rate'],
+            'adversarial/pgd_confidence_drop': pgd['confidence_drop'],
+            'adversarial/pgd_ece_increase': pgd['ece_increase'],
 
-            # PGD with T=1.0
-            'adversarial/pgd_clean_accuracy_T1': adv_results_T1['pgd']['clean_accuracy'],
-            'adversarial/pgd_adv_accuracy_T1': adv_results_T1['pgd']['adversarial_accuracy'],
-            'adversarial/pgd_attack_success_T1': adv_results_T1['pgd']['attack_success_rate'],
+            # C&W metrics
+            'adversarial/cw_clean_accuracy': cw['clean_accuracy'],
+            'adversarial/cw_clean_ece': cw['clean_ece'],
+            'adversarial/cw_clean_confidence': cw['clean_mean_confidence'],
+            'adversarial/cw_adv_accuracy': cw['adversarial_accuracy'],
+            'adversarial/cw_adv_ece': cw['adversarial_ece'],
+            'adversarial/cw_adv_confidence': cw['adversarial_mean_confidence'],
+            'adversarial/cw_attack_success': cw['attack_success_rate'],
+            'adversarial/cw_confidence_drop': cw['confidence_drop'],
+            'adversarial/cw_ece_increase': cw['ece_increase'],
 
-            # C&W with training temperature
-            'adversarial/cw_clean_accuracy_Ttrain': adv_results_Ttrain['cw']['clean_accuracy'],
-            'adversarial/cw_adv_accuracy_Ttrain': adv_results_Ttrain['cw']['adversarial_accuracy'],
-            'adversarial/cw_attack_success_Ttrain': adv_results_Ttrain['cw']['attack_success_rate'],
-
-            # C&W with T=1.0
-            'adversarial/cw_clean_accuracy_T1': adv_results_T1['cw']['clean_accuracy'],
-            'adversarial/cw_adv_accuracy_T1': adv_results_T1['cw']['adversarial_accuracy'],
-            'adversarial/cw_attack_success_T1': adv_results_T1['cw']['attack_success_rate'],
-
-            # Differences
-            'adversarial/pgd_adv_acc_diff_T1_vs_Ttrain': pgd_adv_acc_diff,
-            'adversarial/cw_adv_acc_diff_T1_vs_Ttrain': cw_adv_acc_diff,
+            # Summary metrics
+            'adversarial/mean_adv_accuracy': (pgd['adversarial_accuracy'] + cw['adversarial_accuracy']) / 2,
+            'adversarial/mean_adv_ece': (pgd['adversarial_ece'] + cw['adversarial_ece']) / 2,
+            'adversarial/mean_ece_increase': (pgd['ece_increase'] + cw['ece_increase']) / 2,
         })
 
+        # Store for summary
+        pgd_adv_acc = pgd['adversarial_accuracy']
+        cw_adv_acc = cw['adversarial_accuracy']
+        pgd_adv_ece = pgd['adversarial_ece']
+        cw_adv_ece = cw['adversarial_ece']
+
     # ================================================================
-    # Summary
+    # Updated Summary Section (replace the existing summary)
     # ================================================================
-    print(f'\n' + '='*60)
+
+    print(f'\n' + '=' * 70)
     print('EVALUATION SUMMARY')
-    print('='*60)
+    print('=' * 70)
     print(f'\nModel trained with temperature schedule: {args.temp_schedule}')
     print(f'Temperature at best checkpoint (epoch {checkpoint["epoch"]}): {train_temp:.2f}')
-    print(f'\n{"Metric":<30} {"T_train":<15} {"T=1.0":<15} {"Diff":<15}')
+
+    print(f'\n--- Standard Evaluation ---')
+    print(f'{"Metric":<30} {"T_train":<15} {"T=1.0":<15} {"Diff":<15}')
     print('-' * 75)
     print(f'{"Test Accuracy (%)":<30} {test_acc_Ttrain:<15.2f} {test_acc_T1:<15.2f} {acc_diff:<+15.2f}')
     print(f'{"Test ECE":<30} {test_ece_Ttrain:<15.4f} {test_ece_T1:<15.4f} {ece_diff:<+15.4f}')
 
     if args.eval_corruptions:
-        print(f'{"Corruption Accuracy (%)":<30} {corruption_results_Ttrain["mean_acc"]:<15.2f} {corruption_results_T1["mean_acc"]:<15.2f} {corr_acc_diff:<+15.2f}')
-        print(f'{"Corruption ECE":<30} {corruption_results_Ttrain["mean_ece"]:<15.4f} {corruption_results_T1["mean_ece"]:<15.4f} {corr_ece_diff:<+15.4f}')
+        print(
+            f'{"Corruption Accuracy (%)":<30} {corruption_results_Ttrain["mean_acc"]:<15.2f} {corruption_results_T1["mean_acc"]:<15.2f} {corr_acc_diff:<+15.2f}')
+        print(
+            f'{"Corruption ECE":<30} {corruption_results_Ttrain["mean_ece"]:<15.4f} {corruption_results_T1["mean_ece"]:<15.4f} {corr_ece_diff:<+15.4f}')
 
     if args.eval_adversarial:
+        print(f'\n--- Adversarial Evaluation (T=1.0 only, per paper) ---')
+        print(f'{"Metric":<30} {"PGD-20":<15} {"C&W":<15}')
+        print('-' * 60)
+        print(f'{"Clean Accuracy (%)":<30} {pgd["clean_accuracy"]:<15.2f} {cw["clean_accuracy"]:<15.2f}')
+        print(f'{"Clean ECE":<30} {pgd["clean_ece"]:<15.4f} {cw["clean_ece"]:<15.4f}')
         print(
-            f'{"PGD-20 Adv Acc (%)":<30} {adv_results_Ttrain["pgd"]["adversarial_accuracy"]:<15.2f} {adv_results_T1["pgd"]["adversarial_accuracy"]:<15.2f} {pgd_adv_acc_diff:<+15.2f}')
-        print(
-            f'{"C&W Adv Acc (%)":<30} {adv_results_Ttrain["cw"]["adversarial_accuracy"]:<15.2f} {adv_results_T1["cw"]["adversarial_accuracy"]:<15.2f} {cw_adv_acc_diff:<+15.2f}')
+            f'{"Adversarial Accuracy (%)":<30} {pgd["adversarial_accuracy"]:<15.2f} {cw["adversarial_accuracy"]:<15.2f}')
+        print(f'{"Adversarial ECE":<30} {pgd["adversarial_ece"]:<15.4f} {cw["adversarial_ece"]:<15.4f}')
+        print(f'{"Attack Success Rate (%)":<30} {pgd["attack_success_rate"]:<15.2f} {cw["attack_success_rate"]:<15.2f}')
+        print(f'{"Confidence Drop (pp)":<30} {pgd["confidence_drop"]:<15.2f} {cw["confidence_drop"]:<15.2f}')
+        print(f'{"ECE Increase":<30} {pgd["ece_increase"]:<15.4f} {cw["ece_increase"]:<15.4f}')
 
     print()
-    print('Note: Diff = (T=1.0) - (T_train)')
-    print('      Positive diff in accuracy = T=1.0 performs better')
-    print('      Positive diff in ECE = T=1.0 is worse calibrated')
-    print('='*60)
-
-    wandb.log(final_metrics)
-    wandb.finish()
-
-    print('\nAll metrics logged to W&B!')
-    print('\nDone!')
+    print('NOTES:')
+    print('  - Standard eval: Diff = (T=1.0) - (T_train)')
+    print('  - Adversarial eval: Always T=1.0 per paper methodology')
+    print('  - ECE Increase > 0 means worse calibration under attack')
+    print('  - High ECE + High Attack Success = Overconfident wrong predictions (bad)')
+    print('=' * 70)
 
 
 if __name__ == '__main__':

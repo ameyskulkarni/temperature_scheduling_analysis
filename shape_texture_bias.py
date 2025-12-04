@@ -24,10 +24,10 @@ import os
 
 def get_normalization_params(dataset_name):
     """Get normalization parameters for dataset"""
-    if 'cifar10' in dataset_name.lower():
+    if dataset_name == 'cifar10':
         mean = [0.4914, 0.4822, 0.4465]
         std = [0.2023, 0.1994, 0.2010]
-    else:  # CIFAR-100
+    elif dataset_name == 'cifar100':  # CIFAR-100
         mean = [0.5071, 0.4867, 0.4408]
         std = [0.2675, 0.2565, 0.2761]
     return mean, std
@@ -38,14 +38,6 @@ def normalize_tensor(img_tensor, mean, std):
     mean = torch.tensor(mean).view(3, 1, 1)
     std = torch.tensor(std).view(3, 1, 1)
     return (img_tensor - mean) / std
-
-
-def denormalize_tensor(img_tensor, mean, std):
-    """Remove CIFAR normalization from tensor"""
-    mean = torch.tensor(mean).view(3, 1, 1)
-    std = torch.tensor(std).view(3, 1, 1)
-    return img_tensor * std + mean
-
 
 class PatchShuffledDataset(Dataset):
     """
@@ -176,156 +168,160 @@ class PatchShuffledDataset(Dataset):
         return img_tensor, label
 
 
-class EdgePreservedDataset(Dataset):
-    """
-    Dataset with edge-preserving smoothing (removes texture, keeps shape)
+# class EdgePreservedDataset(Dataset):
+#     """
+#     Dataset with edge-preserving smoothing (removes texture, keeps shape)
+#
+#     FIXES:
+#     - Proper normalization workflow: denorm -> process -> renorm
+#     - Caching for efficiency
+#     """
+#
+#     def __init__(self, original_dataset, dataset_name, cache_perturbations=True):
+#         self.original_dataset = original_dataset
+#         self.cache_perturbations = cache_perturbations
+#         self.mean, self.std = get_normalization_params(dataset_name)
+#         self.cache = {} if cache_perturbations else None
+#
+#     def __len__(self):
+#         return len(self.original_dataset)
+#
+#     def edge_preserving_smooth(self, img_array):
+#         """
+#         Apply bilateral filter
+#
+#         Args:
+#             img_array: (C, H, W) in [0, 1] range
+#         Returns:
+#             smoothed: (C, H, W) in [0, 1] range
+#         """
+#         # Convert to (H, W, C) for cv2
+#         img_hwc = img_array.transpose(1, 2, 0)
+#
+#         # Scale to uint8 for cv2
+#         img_hwc = (img_hwc * 255).clip(0, 255).astype(np.uint8)
+#
+#         # Apply bilateral filter
+#         smoothed = cv2.bilateralFilter(img_hwc, d=9, sigmaColor=75, sigmaSpace=75)
+#
+#         # Back to float [0, 1]
+#         smoothed = smoothed.astype(np.float32) / 255.0
+#
+#         # Back to (C, H, W)
+#         smoothed = smoothed.transpose(2, 0, 1)
+#
+#         return smoothed
+#
+#     def __getitem__(self, idx):
+#         if self.cache is not None and idx in self.cache:
+#             return self.cache[idx]
+#
+#         img, label = self.original_dataset[idx]
+#
+#         # Get unnormalized array [0, 1]
+#         if torch.is_tensor(img):
+#             img_array = img.numpy()
+#         else:
+#             img_array = np.array(img).transpose(2, 0, 1) / 255.0
+#
+#         # Apply smoothing
+#         img_array = self.edge_preserving_smooth(img_array)
+#
+#         # Convert to tensor
+#         img_tensor = torch.from_numpy(img_array).float()
+#
+#         # ✅ FIX: Apply CIFAR normalization
+#         img_tensor = normalize_tensor(img_tensor, self.mean, self.std)
+#
+#         if self.cache is not None:
+#             self.cache[idx] = (img_tensor, label)
+#
+#         return img_tensor, label
 
-    FIXES:
-    - Proper normalization workflow: denorm -> process -> renorm
-    - Caching for efficiency
-    """
 
-    def __init__(self, original_dataset, dataset_name, cache_perturbations=True):
-        self.original_dataset = original_dataset
-        self.cache_perturbations = cache_perturbations
-        self.mean, self.std = get_normalization_params(dataset_name)
-        self.cache = {} if cache_perturbations else None
+# class HighPassFilterDataset(Dataset):
+#     """
+#     Dataset with high-pass filtering (extracts edges/shapes)
+#
+#     FIXES:
+#     - Proper normalization after filtering
+#     - Improved high-pass filter implementation
+#     """
+#
+#     def __init__(self, original_dataset, dataset_name, sigma=2.0, cache_perturbations=True):
+#         self.original_dataset = original_dataset
+#         self.sigma = sigma
+#         self.cache_perturbations = cache_perturbations
+#         self.mean, self.std = get_normalization_params(dataset_name)
+#         self.cache = {} if cache_perturbations else None
+#
+#     def __len__(self):
+#         return len(self.original_dataset)
+#
+#     def high_pass_filter(self, img_array):
+#         """
+#         Extract high-frequency components (edges)
+#
+#         Args:
+#             img_array: (C, H, W) in [0, 1] range
+#         Returns:
+#             high_pass: (C, H, W) normalized to [0, 1]
+#         """
+#         low_pass = np.zeros_like(img_array)
+#         for c in range(img_array.shape[0]):
+#             low_pass[c] = gaussian_filter(img_array[c], sigma=self.sigma)
+#
+#         # High-pass = original - low-pass
+#         high_pass = img_array - low_pass
+#
+#         # Normalize to [0, 1] range
+#         high_pass = (high_pass - high_pass.min()) / (high_pass.max() - high_pass.min() + 1e-8)
+#
+#         return high_pass
+#
+#     def __getitem__(self, idx):
+#         if self.cache is not None and idx in self.cache:
+#             return self.cache[idx]
+#
+#         img, label = self.original_dataset[idx]
+#
+#         # Get array [0, 1]
+#         if torch.is_tensor(img):
+#             img_array = img.numpy()
+#         else:
+#             img_array = np.array(img).transpose(2, 0, 1) / 255.0
+#
+#         # Apply high-pass filter
+#         img_array = self.high_pass_filter(img_array)
+#
+#         # Convert to tensor
+#         img_tensor = torch.from_numpy(img_array).float()
+#
+#         # ✅ FIX: Apply CIFAR normalization
+#         img_tensor = normalize_tensor(img_tensor, self.mean, self.std)
+#
+#         if self.cache is not None:
+#             self.cache[idx] = (img_tensor, label)
+#
+#         return img_tensor, label
 
-    def __len__(self):
-        return len(self.original_dataset)
-
-    def edge_preserving_smooth(self, img_array):
-        """
-        Apply bilateral filter
-
-        Args:
-            img_array: (C, H, W) in [0, 1] range
-        Returns:
-            smoothed: (C, H, W) in [0, 1] range
-        """
-        # Convert to (H, W, C) for cv2
-        img_hwc = img_array.transpose(1, 2, 0)
-
-        # Scale to uint8 for cv2
-        img_hwc = (img_hwc * 255).clip(0, 255).astype(np.uint8)
-
-        # Apply bilateral filter
-        smoothed = cv2.bilateralFilter(img_hwc, d=9, sigmaColor=75, sigmaSpace=75)
-
-        # Back to float [0, 1]
-        smoothed = smoothed.astype(np.float32) / 255.0
-
-        # Back to (C, H, W)
-        smoothed = smoothed.transpose(2, 0, 1)
-
-        return smoothed
-
-    def __getitem__(self, idx):
-        if self.cache is not None and idx in self.cache:
-            return self.cache[idx]
-
-        img, label = self.original_dataset[idx]
-
-        # Get unnormalized array [0, 1]
-        if torch.is_tensor(img):
-            img_array = img.numpy()
-        else:
-            img_array = np.array(img).transpose(2, 0, 1) / 255.0
-
-        # Apply smoothing
-        img_array = self.edge_preserving_smooth(img_array)
-
-        # Convert to tensor
-        img_tensor = torch.from_numpy(img_array).float()
-
-        # ✅ FIX: Apply CIFAR normalization
-        img_tensor = normalize_tensor(img_tensor, self.mean, self.std)
-
-        if self.cache is not None:
-            self.cache[idx] = (img_tensor, label)
-
-        return img_tensor, label
-
-
-class HighPassFilterDataset(Dataset):
-    """
-    Dataset with high-pass filtering (extracts edges/shapes)
-
-    FIXES:
-    - Proper normalization after filtering
-    - Improved high-pass filter implementation
-    """
-
-    def __init__(self, original_dataset, dataset_name, sigma=2.0, cache_perturbations=True):
-        self.original_dataset = original_dataset
-        self.sigma = sigma
-        self.cache_perturbations = cache_perturbations
-        self.mean, self.std = get_normalization_params(dataset_name)
-        self.cache = {} if cache_perturbations else None
-
-    def __len__(self):
-        return len(self.original_dataset)
-
-    def high_pass_filter(self, img_array):
-        """
-        Extract high-frequency components (edges)
-
-        Args:
-            img_array: (C, H, W) in [0, 1] range
-        Returns:
-            high_pass: (C, H, W) normalized to [0, 1]
-        """
-        low_pass = np.zeros_like(img_array)
-        for c in range(img_array.shape[0]):
-            low_pass[c] = gaussian_filter(img_array[c], sigma=self.sigma)
-
-        # High-pass = original - low-pass
-        high_pass = img_array - low_pass
-
-        # Normalize to [0, 1] range
-        high_pass = (high_pass - high_pass.min()) / (high_pass.max() - high_pass.min() + 1e-8)
-
-        return high_pass
-
-    def __getitem__(self, idx):
-        if self.cache is not None and idx in self.cache:
-            return self.cache[idx]
-
-        img, label = self.original_dataset[idx]
-
-        # Get array [0, 1]
-        if torch.is_tensor(img):
-            img_array = img.numpy()
-        else:
-            img_array = np.array(img).transpose(2, 0, 1) / 255.0
-
-        # Apply high-pass filter
-        img_array = self.high_pass_filter(img_array)
-
-        # Convert to tensor
-        img_tensor = torch.from_numpy(img_array).float()
-
-        # ✅ FIX: Apply CIFAR normalization
-        img_tensor = normalize_tensor(img_tensor, self.mean, self.std)
-
-        if self.cache is not None:
-            self.cache[idx] = (img_tensor, label)
-
-        return img_tensor, label
-
+def temperature_scaled_loss(logits, targets, temperature):
+    """Cross-entropy with temperature scaling"""
+    scaled_logits = logits / temperature
+    return nn.CrossEntropyLoss()(scaled_logits, targets)
 
 def evaluate_accuracy(model, loader, device, temperature=1.0):
     """
     Evaluate accuracy with specified temperature
 
-    FIXES:
-    - Temperature parameter for consistent evaluation
-    - Returns predictions for further analysis
+    Note: Accuracy is computed using raw logits (argmax is invariant to
+    monotonic transformations like temperature scaling).
     """
     model.eval()
     correct = 0
     total = 0
-    all_preds = []
+    total_loss = 0
+    all_probs = []
     all_targets = []
 
     with torch.no_grad():
@@ -333,29 +329,29 @@ def evaluate_accuracy(model, loader, device, temperature=1.0):
             inputs, targets = inputs.to(device), targets.to(device)
 
             logits = model(inputs)
+            loss = temperature_scaled_loss(logits, targets, temperature)
 
-            # ✅ FIX: Use temperature-scaled predictions
-            if temperature != 1.0:
-                probs = F.softmax(logits / temperature, dim=1)
-                _, predicted = probs.max(1)
-            else:
-                _, predicted = logits.max(1)
+            total_loss += loss.item() * inputs.size(0)
+
+            # ✅ Always use raw logits - matches train.py validate()
+            _, predicted = logits.max(1)
 
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            all_preds.append(predicted.cpu())
+            probs = torch.softmax(logits / temperature, dim=1)
+            all_probs.append(probs.cpu())
             all_targets.append(targets.cpu())
 
     accuracy = 100. * correct / total
-    all_preds = torch.cat(all_preds)
+    all_probs = torch.cat(all_probs)
     all_targets = torch.cat(all_targets)
 
-    return accuracy, all_preds, all_targets
+    return accuracy, all_probs, all_targets
 
 
-def evaluate_shape_texture_bias(model, test_dataset, dataset_name, batch_size=128,
-                                shuffle_indices_path='shuffle_indices.npy',
+def evaluate_shape_texture_bias(model, dataset_name, data_root, batch_size=128,
+                                shuffle_indices_path='shuffle_indices_cifar100.npy',
                                 num_workers=4, device='cuda', temperature=1.0):
     """
     Comprehensive perturbation robustness evaluation
@@ -368,7 +364,6 @@ def evaluate_shape_texture_bias(model, test_dataset, dataset_name, batch_size=12
 
     Args:
         model: Trained model
-        test_dataset: CIFAR test dataset with ToTensor() only (no normalization)
         dataset_name: 'cifar10' or 'cifar100'
         batch_size: Batch size
         shuffle_indices_path: Path for deterministic shuffle indices
@@ -392,6 +387,7 @@ def evaluate_shape_texture_bias(model, test_dataset, dataset_name, batch_size=12
     # ================================================================
     print("\n[1/4] Evaluating ORIGINAL images (with proper normalization)...")
     mean, std = get_normalization_params(dataset_name)
+    print(f"mean: {mean}, std: {std}")
 
     # Create properly normalized dataset
     from torchvision import transforms
@@ -401,73 +397,88 @@ def evaluate_shape_texture_bias(model, test_dataset, dataset_name, batch_size=12
     ])
 
     # Need to re-create dataset with normalization
-    if 'cifar10' in dataset_name.lower():
+    if dataset_name == 'cifar10':
         import torchvision
         normalized_dataset = torchvision.datasets.CIFAR10(
-            root=test_dataset.root, train=False, download=False,
+            root=data_root, train=False, download=False,
+            transform=normalize_transform
+        )
+    elif dataset_name == 'cifar100':
+        import torchvision
+        normalized_dataset = torchvision.datasets.CIFAR100(
+            root=data_root, train=False, download=False,
             transform=normalize_transform
         )
     else:
-        import torchvision
-        normalized_dataset = torchvision.datasets.CIFAR100(
-            root=test_dataset.root, train=False, download=False,
-            transform=normalize_transform
-        )
+        raise ValueError(f"Unknown dataset: {dataset_name}. Expected 'cifar10' or 'cifar100'")
 
     original_loader = DataLoader(normalized_dataset, batch_size=batch_size,
                                  shuffle=False, num_workers=num_workers, pin_memory=True)
     original_acc, _, _ = evaluate_accuracy(model, original_loader, device, temperature)
+    print(f"$$$$$$$$$$$$$$$$$$$$$$$$ORIGINAL ACCURACY: {original_acc:.2f}")
     print(f"✓ Original Accuracy: {original_acc:.2f}%")
 
     # ================================================================
-    # 2. Patch-shuffled (texture disruption)
+    # 2. Patch-shuffled (texture disruption) Patch size = 8pix
     # ================================================================
+    if dataset_name == 'cifar10':
+        import torchvision
+        unnormalized_dataset = torchvision.datasets.CIFAR10(
+            root=data_root, train=False, download=False,
+            transform=None
+        )
+    elif dataset_name == 'cifar100':
+        import torchvision
+        unnormalized_dataset = torchvision.datasets.CIFAR100(
+            root=data_root, train=False, download=False,
+            transform=None
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Expected 'cifar10' or 'cifar100'")
+
     print("\n[2/4] Evaluating PATCH-SHUFFLED images...")
     shuffled_dataset = PatchShuffledDataset(
-        test_dataset, dataset_name, patch_size=8,
+        unnormalized_dataset, dataset_name, patch_size=8,
         shuffle_indices_path=shuffle_indices_path
     )
     shuffled_loader = DataLoader(shuffled_dataset, batch_size=batch_size,
                                  shuffle=False, num_workers=num_workers, pin_memory=True)
-    shuffled_acc, _, _ = evaluate_accuracy(model, shuffled_loader, device, temperature)
+    shuffled_acc, shuffled_all_probs, shuffled_all_targets = evaluate_accuracy(model, shuffled_loader, device, temperature)
     print(f"✓ Patch-Shuffled Accuracy: {shuffled_acc:.2f}%")
 
     # ================================================================
     # 3. Edge-preserved (texture removal)
     # ================================================================
-    print("\n[3/4] Evaluating EDGE-PRESERVED images...")
-    edge_dataset = EdgePreservedDataset(test_dataset, dataset_name)
-    edge_loader = DataLoader(edge_dataset, batch_size=batch_size,
-                             shuffle=False, num_workers=num_workers, pin_memory=True)
-    edge_acc, _, _ = evaluate_accuracy(model, edge_loader, device, temperature)
-    print(f"✓ Edge-Preserved Accuracy: {edge_acc:.2f}%")
+    # print("\n[3/4] Evaluating EDGE-PRESERVED images...")
+    # edge_dataset = EdgePreservedDataset(test_dataset, dataset_name)
+    # edge_loader = DataLoader(edge_dataset, batch_size=batch_size,
+    #                          shuffle=False, num_workers=num_workers, pin_memory=True)
+    # edge_acc, _, _ = evaluate_accuracy(model, edge_loader, device, temperature)
+    # print(f"✓ Edge-Preserved Accuracy: {edge_acc:.2f}%")
 
     # ================================================================
     # 4. High-pass filtered (edges only)
     # ================================================================
-    print("\n[4/4] Evaluating HIGH-PASS FILTERED images...")
-    highpass_dataset = HighPassFilterDataset(test_dataset, dataset_name, sigma=2.0)
-    highpass_loader = DataLoader(highpass_dataset, batch_size=batch_size,
-                                 shuffle=False, num_workers=num_workers, pin_memory=True)
-    highpass_acc, _, _ = evaluate_accuracy(model, highpass_loader, device, temperature)
-    print(f"✓ High-Pass Accuracy: {highpass_acc:.2f}%")
+    # print("\n[4/4] Evaluating HIGH-PASS FILTERED images...")
+    # highpass_dataset = HighPassFilterDataset(test_dataset, dataset_name, sigma=2.0)
+    # highpass_loader = DataLoader(highpass_dataset, batch_size=batch_size,
+    #                              shuffle=False, num_workers=num_workers, pin_memory=True)
+    # highpass_acc, _, _ = evaluate_accuracy(model, highpass_loader, device, temperature)
+    # print(f"✓ High-Pass Accuracy: {highpass_acc:.2f}%")
 
     # ================================================================
     # Calculate metrics (renamed for accuracy)
     # ================================================================
-    perturbation_robustness = (shuffled_acc + edge_acc + highpass_acc) / 3
-    robustness_ratio = perturbation_robustness / original_acc if original_acc > 0 else 0
-    texture_dependency = (original_acc - perturbation_robustness) / original_acc if original_acc > 0 else 0
+    # perturbation_robustness = (shuffled_acc + edge_acc + highpass_acc) / 3
+    # robustness_ratio = perturbation_robustness / original_acc if original_acc > 0 else 0
+    # texture_dependency = (original_acc - perturbation_robustness) / original_acc if original_acc > 0 else 0
 
     results = {
         'original_accuracy': original_acc,
         'patch_shuffled_accuracy': shuffled_acc,
-        'edge_preserved_accuracy': edge_acc,
-        'highpass_accuracy': highpass_acc,
-        'perturbation_robustness_score': perturbation_robustness,
-        'robustness_ratio': robustness_ratio,
-        'texture_dependency': texture_dependency,
         'evaluation_temperature': temperature,
+        'shuffled_all_probs': shuffled_all_probs,
+        'shuffled_all_targets': shuffled_all_targets,
     }
 
     # ================================================================
@@ -478,35 +489,22 @@ def evaluate_shape_texture_bias(model, test_dataset, dataset_name, batch_size=12
     print("="*80)
     print(f"Original Accuracy:             {original_acc:.2f}%")
     print(f"Patch-Shuffled Accuracy:       {shuffled_acc:.2f}%")
-    print(f"Edge-Preserved Accuracy:       {edge_acc:.2f}%")
-    print(f"High-Pass Accuracy:            {highpass_acc:.2f}%")
-    print(f"\nPerturbation Robustness Score: {perturbation_robustness:.2f}%")
-    print(f"Robustness Ratio:              {robustness_ratio:.4f}")
-    print(f"Texture Dependency:            {texture_dependency:.4f}")
     print(f"\nEvaluation Temperature:        {temperature:.2f}")
-    print("\n" + "="*80)
-    print("INTERPRETATION:")
-    print("  - Robustness Ratio: Proportion of accuracy retained under perturbations")
-    print("  - High ratio (>0.7): Model maintains performance without texture details")
-    print("  - Low ratio (<0.4): Model relies heavily on fine-grained texture")
-    print("  - Texture Dependency: Proportion of accuracy lost without texture")
-    print("\nNOTE: This measures perturbation robustness, NOT true shape bias.")
-    print("      True shape bias requires cue-conflict stimuli (e.g., stylized images).")
     print("="*80)
 
     return results
 
 
-def run_bias_evaluation(model, test_dataset, dataset_name, batch_size=128,
+def run_bias_evaluation(model, dataset_name, data_root, batch_size=128,
                        device='cuda', temperature=1.0,
-                       shuffle_indices_path='shuffle_indices.npy'):
+                       shuffle_indices_path='shuffle_indices_cifar100.npy'):
     """
     Convenience wrapper with corrected implementation
 
     ✅ ALL FIXES APPLIED
     """
     return evaluate_shape_texture_bias(
-        model, test_dataset, dataset_name, batch_size,
+        model, dataset_name, data_root, batch_size,
         shuffle_indices_path, num_workers=4, device=device,
         temperature=temperature
     )
