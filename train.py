@@ -649,7 +649,7 @@ def main():
     # ================================================================
     # Updated Summary Section (replace the existing summary)
     # ================================================================
-
+    wandb.log(final_metrics)
     print(f'\n' + '=' * 70)
     print('EVALUATION SUMMARY')
     print('=' * 70)
