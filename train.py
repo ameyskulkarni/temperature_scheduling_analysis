@@ -368,7 +368,7 @@ def main():
             print(f'Checkpoint saved at epoch {epoch}.')
 
         # Save model checkpoint every few epochs
-        if epoch > 159 and epoch % 2 == 0:
+        if epoch > 149:
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
