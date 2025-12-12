@@ -14,6 +14,8 @@ import torchvision
 import torchvision.transforms as transforms
 import wandb
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
 
 from models import get_model
 from lr_scheduler import get_lr_scheduler
@@ -90,6 +92,10 @@ def parse_args():
     parser.add_argument('--adv-epsilon', type=float, default=8 / 255,
                         help='Adversarial perturbation budget (default: 8/255)')
 
+    parser.add_argument('--eval-split', type=str, default='val',
+                        choices=['val', 'test'],
+                        help='Which split to use for evaluation during training (val or test)')
+
     # System
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -118,9 +124,18 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-
 def get_data_loaders(dataset_name, data_root, batch_size, num_workers, generator):
-    """Load CIFAR dataset"""
+    """Load CIFAR dataset with train/val/test splits
+
+    Train is split into:
+    - train (90%): used for training
+    - val (10%): stratified split with equal samples per class
+
+    The split is reproducible using the provided seed.
+    """
+    from torch.utils.data import Subset
+    from sklearn.model_selection import train_test_split
+    import numpy as np
 
     # Normalization
     if dataset_name == 'cifar10':
@@ -128,11 +143,13 @@ def get_data_loaders(dataset_name, data_root, batch_size, num_workers, generator
         std = [0.2023, 0.1994, 0.2010]
         num_classes = 10
         dataset_class = torchvision.datasets.CIFAR10
-    elif dataset_name == 'cifar100':  # cifar100
+    elif dataset_name == 'cifar100':
         mean = [0.5071, 0.4867, 0.4408]
         std = [0.2675, 0.2565, 0.2761]
         num_classes = 100
         dataset_class = torchvision.datasets.CIFAR100
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Transforms
     train_transform = transforms.Compose([
@@ -147,22 +164,61 @@ def get_data_loaders(dataset_name, data_root, batch_size, num_workers, generator
         transforms.Normalize(mean, std)
     ])
 
-    # Datasets
-    train_dataset = dataset_class(root=data_root, train=True, download=True,
-                                   transform=train_transform)
+    # Load full training dataset (without augmentation first for splitting)
+    full_train_dataset = dataset_class(root=data_root, train=True, download=True,
+                                       transform=train_transform)
+
+    # Load test dataset
     test_dataset = dataset_class(root=data_root, train=False, download=True,
-                                  transform=test_transform)
+                                 transform=test_transform)
+
+    # Get targets for stratified splitting
+    targets = np.array(full_train_dataset.targets)
+    indices = np.arange(len(full_train_dataset))
+
+    # Stratified split: 90% train, 10% val
+    # Using sklearn's train_test_split with stratify ensures equal class proportions
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=0.1,
+        random_state=100,  # Fixed seed for reproducibility
+        stratify=targets  # Ensures equal proportion from each class
+    )
+
+    # Create subset datasets
+    train_dataset = Subset(full_train_dataset, train_indices)
+
+    # For validation, we need test-time transforms (no augmentation)
+    # Create a separate dataset with test transforms for validation
+    val_base_dataset = dataset_class(root=data_root, train=True, download=False,
+                                     transform=test_transform)
+    val_dataset = Subset(val_base_dataset, val_indices)
+
+    # Print split information
+    print(f"\nDataset split information:")
+    print(f"  Total training samples: {len(full_train_dataset)}")
+    print(f"  Train split: {len(train_dataset)} samples (90%)")
+    print(f"  Val split: {len(val_dataset)} samples (10%)")
+    print(f"  Test split: {len(test_dataset)} samples")
+
+    # Verify stratification
+    train_targets = targets[train_indices]
+    val_targets = targets[val_indices]
+    print(f"  Val samples per class: {len(val_indices) // num_classes}")
 
     # DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                             num_workers=num_workers, pin_memory=True,
-                             worker_init_fn=seed_worker, generator=generator)
+                              num_workers=num_workers, pin_memory=True,
+                              worker_init_fn=seed_worker, generator=generator)
 
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True)
 
-    return train_loader, test_loader, num_classes
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=True)
 
+
+    return train_loader, val_loader, test_loader, num_classes
 
 def temperature_scaled_loss(logits, targets, temperature):
     """Cross-entropy with temperature scaling"""
@@ -262,9 +318,14 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     # Load data
-    train_loader, test_loader, num_classes = get_data_loaders(
+    train_loader, val_loader, test_loader, num_classes = get_data_loaders(
         args.dataset, args.data_root, args.batch_size, args.num_workers, generator
     )
+
+    # Select evaluation loader based on argument
+    eval_loader = val_loader if args.eval_split == 'val' else test_loader
+    eval_split_name = args.eval_split
+    print(f"Using {eval_split_name} split for evaluation during training")
 
     print(f'Dataset: {args.dataset} ({num_classes} classes)')
     print(f'Model: {args.model}')
@@ -312,7 +373,7 @@ def main():
 
         # Validate
         val_loss, val_acc, val_probs, val_targets = validate(
-            model, test_loader, current_temp, device
+            model, eval_loader, current_temp, device
         )
 
         # Compute ECE every 10 epochs
@@ -353,6 +414,7 @@ def main():
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
                 'val_accuracy': val_acc,
+                'eval_split': eval_split_name,
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
 
@@ -363,6 +425,7 @@ def main():
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
                 'val_accuracy': val_acc,
+                'eval_split': eval_split_name,
             }
             torch.save(checkpoint, f'models/{args.exp_name}/model_{epoch}.pth')
             print(f'Checkpoint saved at epoch {epoch}.')
@@ -374,6 +437,7 @@ def main():
                 'epoch': epoch,
                 'train_temperature': current_temp,  # Save the temperature used during training
                 'val_accuracy': val_acc,
+                'eval_split': eval_split_name,
             }
             torch.save(checkpoint, f'models/{args.exp_name}/model_{epoch}.pth')
             print(f'Checkpoint saved at epoch {epoch}.')
@@ -399,7 +463,7 @@ def main():
     print(f'\n--- Evaluation with Training Temperature (T={train_temp:.2f}) ---')
 
     test_loss_Ttrain, test_acc_Ttrain, test_probs_Ttrain, test_targets = validate(
-        model, test_loader, train_temp, device
+        model, eval_loader, train_temp, device
     )
     test_ece_Ttrain = compute_ece(test_probs_Ttrain, test_targets)
 
@@ -412,7 +476,7 @@ def main():
     print(f'\n--- Evaluation with Standard Temperature (T=1.0) ---')
 
     test_loss_T1, test_acc_T1, test_probs_T1, test_targets = validate(
-        model, test_loader, 1.0, device
+        model, eval_loader, 1.0, device
     )
     test_ece_T1 = compute_ece(test_probs_T1, test_targets)
 
